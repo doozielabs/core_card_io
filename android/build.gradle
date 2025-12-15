@@ -26,13 +26,17 @@ apply plugin: 'kotlin-android'
 
 android {
     namespace "core.cardio.core_card_io_beta"
-    compileSdkVersion 30
+   
+    // FIX 1: Updated to 36 to support newer Android resources (lStar, etc.)
+    compileSdkVersion 36
 
     sourceSets {
         main.java.srcDirs += 'src/main/java'
     }
     defaultConfig {
         minSdkVersion 19
+        // FIX 2: Added targetSdkVersion 36
+        targetSdkVersion 36 
         testInstrumentationRunner "android.support.test.runner.AndroidJUnitRunner"
     }
     lintOptions {
