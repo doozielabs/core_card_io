@@ -1,5 +1,5 @@
 #import "CoreCardIoPlugin.h"
-#import "CardIO.h"
+#import <CardIO/CardIO.h>
 
 @interface CoreCardIoPlugin ()<CardIOPaymentViewControllerDelegate>
 @end
