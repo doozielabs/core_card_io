@@ -18,6 +18,15 @@
   [registrar addMethodCallDelegate:instance channel:channel];
 }
 
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        // Preload CardIO to make the launch faster and smoother
+        [CardIOUtilities preloadCardIO];
+    }
+    return self;
+}
+
 - (void)handleMethodCall:(FlutterMethodCall*)call result:(FlutterResult)result {
   if ([@"scanCard" isEqualToString:call.method]) {
       _result = result;
@@ -28,11 +37,9 @@
 }
 
 - (void)scanCard:(NSDictionary*)arguments {
-    // 1. Use the STANDARD CardIOPaymentViewController (Reverted from subclass to fix "screen not showing")
     CardIOPaymentViewController *scanViewController = [[CardIOPaymentViewController alloc] initWithPaymentDelegate:self];
     
-    // --- Mapped Properties (fixes property not found errors) ---
-    
+    // --- Mapped Properties ---
     if (arguments[@"guideColor"]) {
         scanViewController.guideColor = [self colorFromHex:arguments[@"guideColor"]];
     }
@@ -43,18 +50,18 @@
         scanViewController.useCardIOLogo = [arguments[@"useCardIOLogo"] boolValue];
     }
     
-    // Map "suppressManualEntry" to "disableManualEntryButtons"
+    // Correctly mapped properties for iOS SDK
     if (arguments[@"suppressManualEntry"]) {
         scanViewController.disableManualEntryButtons = [arguments[@"suppressManualEntry"] boolValue];
     }
-    
-    // Map "suppressConfirmation" to "suppressScanConfirmation"
     if (arguments[@"suppressConfirmation"]) {
         scanViewController.suppressScanConfirmation = [arguments[@"suppressConfirmation"] boolValue];
     }
     
-    // Note: 'requireExpiry', 'requireCVV', 'requirePostalCode' are intentionally omitted
-    // as they are not supported on the iOS CardIOPaymentViewController class.
+    // These properties are Android-only or not available on iOS CardIOPaymentViewController
+    // scanViewController.requireExpiry = ... (Not supported on iOS)
+    // scanViewController.requireCVV = ... (Not supported on iOS)
+    // scanViewController.requirePostalCode = ... (Not supported on iOS)
     
     if (arguments[@"scanExpiry"]) {
         scanViewController.scanExpiry = [arguments[@"scanExpiry"] boolValue];
@@ -70,29 +77,79 @@
     
     _scanViewController = scanViewController;
     
-    UIViewController *rootViewController = [UIApplication sharedApplication].delegate.window.rootViewController;
+    // FIX: Get the correct top-most View Controller to present from
+    UIViewController *topController = [self topViewController];
     
-    // 2. Present the controller, then apply the fix in the completion block
-    [rootViewController presentViewController:scanViewController animated:YES completion:^{
-        [self applyAutofocusFix];
-    }];
+    if (topController) {
+        [topController presentViewController:scanViewController animated:YES completion:^{
+            // Apply the autofocus fix for newer iPhones (14 Pro, 15 Pro, 17, etc.)
+            [self applyAutofocusFix];
+        }];
+    } else {
+        NSLog(@"[CoreCardIO] Error: Could not find a root view controller to present the camera.");
+        if (_result) {
+            _result([FlutterError errorWithCode:@"presentation_error" message:@"Could not find root view controller" details:nil]);
+            _result = nil;
+        }
+    }
 }
 
-// 3. The Camera Fix: Force Zoom 2x on newer devices (iOS 15+)
+// Helper to find the correct window and root controller (Handle iOS 13+ Scenes)
+- (UIViewController *)topViewController {
+    UIWindow *window = nil;
+    
+    // 1. Try to find the active window in iOS 13+ Scenes
+    if (@available(iOS 13.0, *)) {
+        for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
+            if (scene.activationState == UISceneActivationStateForegroundActive) {
+                for (UIWindow *w in scene.windows) {
+                    if (w.isKeyWindow) {
+                        window = w;
+                        break;
+                    }
+                }
+            }
+            if (window) break;
+        }
+    }
+    
+    // 2. Fallback to legacy keyWindow
+    if (!window) {
+        window = [UIApplication sharedApplication].keyWindow;
+    }
+    
+    if (!window) {
+        return nil;
+    }
+    
+    return [self findTopViewController:window.rootViewController];
+}
+
+// Recursively find the top-most view controller (handle Navigation, TabBar, Modals)
+- (UIViewController *)findTopViewController:(UIViewController *)root {
+    if ([root isKindOfClass:[UINavigationController class]]) {
+        return [self findTopViewController:[(UINavigationController *)root visibleViewController]];
+    }
+    if ([root isKindOfClass:[UITabBarController class]]) {
+        return [self findTopViewController:[(UITabBarController *)root selectedViewController]];
+    }
+    if (root.presentedViewController) {
+        return [self findTopViewController:root.presentedViewController];
+    }
+    return root;
+}
+
+// The Camera Fix for iPhone 14 Pro / 15 Pro / 17
 - (void)applyAutofocusFix {
-    // We use a small delay to ensure CardIO has fully started its AVCaptureSession
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (@available(iOS 15.0, *)) {
             AVCaptureDevice *device = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
             if (device) {
-                // Check if device supports focus distance (approx proxy for "Pro" cameras or newer sensors)
-                BOOL isNewerDevice = (device.minimumFocusDistance > 100); 
-                
-                if (isNewerDevice) {
+                // If minimum focus distance is high (approx > 100mm), it's a newer "Pro" sensor
+                if (device.minimumFocusDistance > 100) {
                     NSError *error = nil;
                     if ([device lockForConfiguration:&error]) {
-                        // 2.0x zoom allows the user to hold the card further away, 
-                        // bypassing the minimum focus distance limit of newer sensors.
+                        // 2.0x zoom forces the user to move back, putting the card in focus
                         CGFloat zoomFactor = 2.0;
                         if (zoomFactor <= device.activeFormat.videoMaxZoomFactor) {
                             device.videoZoomFactor = zoomFactor;
