@@ -11,9 +11,11 @@
 }
 
 + (void)registerWithRegistrar:(NSObject<FlutterPluginRegistrar>*)registrar {
+  // Ensure this matches your Dart file's channel name
   FlutterMethodChannel* channel = [FlutterMethodChannel
-      methodChannelWithName:@"core_card_io"
+      methodChannelWithName:@"core_card_io_beta"
             binaryMessenger:[registrar messenger]];
+            
   CoreCardIoPlugin* instance = [[CoreCardIoPlugin alloc] init];
   [registrar addMethodCallDelegate:instance channel:channel];
 }
@@ -21,13 +23,15 @@
 - (instancetype)init {
     self = [super init];
     if (self) {
-        // Preload CardIO to make the launch faster and smoother
+        NSLog(@"[CoreCardIO] Plugin initialized. Preloading CardIO...");
         [CardIOUtilities preloadCardIO];
     }
     return self;
 }
 
 - (void)handleMethodCall:(FlutterMethodCall*)call result:(FlutterResult)result {
+  NSLog(@"[CoreCardIO] Method Channel received call: %@", call.method);
+
   if ([@"scanCard" isEqualToString:call.method]) {
       _result = result;
       [self scanCard:call.arguments];
@@ -37,68 +41,80 @@
 }
 
 - (void)scanCard:(NSDictionary*)arguments {
-    CardIOPaymentViewController *scanViewController = [[CardIOPaymentViewController alloc] initWithPaymentDelegate:self];
-    
-    // --- Mapped Properties ---
-    if (arguments[@"guideColor"]) {
-        scanViewController.guideColor = [self colorFromHex:arguments[@"guideColor"]];
-    }
-    if (arguments[@"hideCardIOLogo"]) {
-        scanViewController.hideCardIOLogo = [arguments[@"hideCardIOLogo"] boolValue];
-    }
-    if (arguments[@"useCardIOLogo"]) {
-        scanViewController.useCardIOLogo = [arguments[@"useCardIOLogo"] boolValue];
+    NSLog(@"[CoreCardIO] scanCard processing started.");
+
+    // 1. Check Camera Availability
+    BOOL canRead = [CardIOUtilities canReadCardWithCamera];
+    if (!canRead) {
+        NSLog(@"[CoreCardIO] WARNING: CardIOUtilities says it cannot read card with camera.");
     }
     
-    // Correctly mapped properties for iOS SDK
-    if (arguments[@"suppressManualEntry"]) {
-        scanViewController.disableManualEntryButtons = [arguments[@"suppressManualEntry"] boolValue];
-    }
-    if (arguments[@"suppressConfirmation"]) {
-        scanViewController.suppressScanConfirmation = [arguments[@"suppressConfirmation"] boolValue];
-    }
-    
-    // These properties are Android-only or not available on iOS CardIOPaymentViewController
-    // scanViewController.requireExpiry = ... (Not supported on iOS)
-    // scanViewController.requireCVV = ... (Not supported on iOS)
-    // scanViewController.requirePostalCode = ... (Not supported on iOS)
-    
-    if (arguments[@"scanExpiry"]) {
-        scanViewController.scanExpiry = [arguments[@"scanExpiry"] boolValue];
-    }
-    if (arguments[@"scanInstructions"]) {
-        scanViewController.scanInstructions = arguments[@"scanInstructions"];
-    }
-    if (arguments[@"scannedImageDuration"]) {
-        scanViewController.scannedImageDuration = [arguments[@"scannedImageDuration"] doubleValue];
-    }
-    
-    scanViewController.modalPresentationStyle = UIModalPresentationFullScreen;
-    
-    _scanViewController = scanViewController;
-    
-    // FIX: Get the correct top-most View Controller to present from
-    UIViewController *topController = [self topViewController];
-    
-    if (topController) {
-        [topController presentViewController:scanViewController animated:YES completion:^{
-            // Apply the autofocus fix for newer iPhones (14 Pro, 15 Pro, 17, etc.)
-            [self applyAutofocusFix];
-        }];
-    } else {
-        NSLog(@"[CoreCardIO] Error: Could not find a root view controller to present the camera.");
-        if (_result) {
-            _result([FlutterError errorWithCode:@"presentation_error" message:@"Could not find root view controller" details:nil]);
-            _result = nil;
+    // 2. Ensure UI work is done on the MAIN THREAD
+    dispatch_async(dispatch_get_main_queue(), ^{
+        
+        CardIOPaymentViewController *scanViewController = [[CardIOPaymentViewController alloc] initWithPaymentDelegate:self];
+        
+        // --- Safe Property Extraction ---
+        if ([self isNonNull:arguments[@"guideColor"]]) {
+            scanViewController.guideColor = [self colorFromHex:arguments[@"guideColor"]];
         }
-    }
+        
+        scanViewController.hideCardIOLogo = [self safeBool:arguments forKey:@"hideCardIOLogo" defaultsTo:NO];
+        scanViewController.useCardIOLogo = [self safeBool:arguments forKey:@"useCardIOLogo" defaultsTo:NO];
+        scanViewController.disableManualEntryButtons = [self safeBool:arguments forKey:@"suppressManualEntry" defaultsTo:NO];
+        scanViewController.suppressScanConfirmation = [self safeBool:arguments forKey:@"suppressConfirmation" defaultsTo:NO];
+        scanViewController.scanExpiry = [self safeBool:arguments forKey:@"scanExpiry" defaultsTo:YES];
+        
+        if ([self isNonNull:arguments[@"scanInstructions"]]) {
+            scanViewController.scanInstructions = arguments[@"scanInstructions"];
+        }
+        
+        if ([self isNonNull:arguments[@"scannedImageDuration"]]) {
+            scanViewController.scannedImageDuration = [arguments[@"scannedImageDuration"] doubleValue];
+        }
+        
+        scanViewController.modalPresentationStyle = UIModalPresentationFullScreen;
+        _scanViewController = scanViewController;
+        
+        // 3. Find the best View Controller to present on
+        UIViewController *topController = [self topViewController];
+        
+        if (topController) {
+            NSLog(@"[CoreCardIO] Presenting Camera Scanner...");
+            [topController presentViewController:scanViewController animated:YES completion:^{
+                NSLog(@"[CoreCardIO] Presentation COMPLETED. View should be visible.");
+                // 4. Apply the Autofocus Fix for iPhone 14 Pro/17
+                [self applyAutofocusFix];
+            }];
+        } else {
+            NSLog(@"[CoreCardIO] ERROR: Could not find a root view controller.");
+            if (_result) {
+                _result([FlutterError errorWithCode:@"presentation_error" message:@"Could not find root view controller" details:nil]);
+                _result = nil;
+            }
+        }
+    });
 }
 
-// Helper to find the correct window and root controller (Handle iOS 13+ Scenes)
+// --- Helper Methods for Safety ---
+
+- (BOOL)isNonNull:(id)value {
+    return value != nil && value != [NSNull null];
+}
+
+- (BOOL)safeBool:(NSDictionary *)dict forKey:(NSString *)key defaultsTo:(BOOL)fallback {
+    id value = dict[key];
+    if ([self isNonNull:value]) {
+        if ([value respondsToSelector:@selector(boolValue)]) {
+            return [value boolValue];
+        }
+    }
+    return fallback;
+}
+
+// Helper to find the correct window and root controller
 - (UIViewController *)topViewController {
     UIWindow *window = nil;
-    
-    // 1. Try to find the active window in iOS 13+ Scenes
     if (@available(iOS 13.0, *)) {
         for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
             if (scene.activationState == UISceneActivationStateForegroundActive) {
@@ -112,20 +128,12 @@
             if (window) break;
         }
     }
-    
-    // 2. Fallback to legacy keyWindow
-    if (!window) {
-        window = [UIApplication sharedApplication].keyWindow;
-    }
-    
-    if (!window) {
-        return nil;
-    }
+    if (!window) window = [UIApplication sharedApplication].keyWindow;
+    if (!window) return nil;
     
     return [self findTopViewController:window.rootViewController];
 }
 
-// Recursively find the top-most view controller (handle Navigation, TabBar, Modals)
 - (UIViewController *)findTopViewController:(UIViewController *)root {
     if ([root isKindOfClass:[UINavigationController class]]) {
         return [self findTopViewController:[(UINavigationController *)root visibleViewController]];
@@ -139,23 +147,20 @@
     return root;
 }
 
-// The Camera Fix for iPhone 14 Pro / 15 Pro / 17
+// The Camera Fix logic
 - (void)applyAutofocusFix {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (@available(iOS 15.0, *)) {
             AVCaptureDevice *device = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
-            if (device) {
-                // If minimum focus distance is high (approx > 100mm), it's a newer "Pro" sensor
-                if (device.minimumFocusDistance > 100) {
-                    NSError *error = nil;
-                    if ([device lockForConfiguration:&error]) {
-                        // 2.0x zoom forces the user to move back, putting the card in focus
-                        CGFloat zoomFactor = 2.0;
-                        if (zoomFactor <= device.activeFormat.videoMaxZoomFactor) {
-                            device.videoZoomFactor = zoomFactor;
-                        }
-                        [device unlockForConfiguration];
+            if (device && device.minimumFocusDistance > 100) {
+                NSError *error = nil;
+                if ([device lockForConfiguration:&error]) {
+                    CGFloat zoomFactor = 2.0;
+                    if (zoomFactor <= device.activeFormat.videoMaxZoomFactor) {
+                        device.videoZoomFactor = zoomFactor;
+                        NSLog(@"[CoreCardIO] Autofocus Fix: Zoomed to 2.0x");
                     }
+                    [device unlockForConfiguration];
                 }
             }
         }
@@ -165,6 +170,7 @@
 #pragma mark - CardIOPaymentViewControllerDelegate
 
 - (void)userDidCancelPaymentViewController:(CardIOPaymentViewController *)scanViewController {
+    NSLog(@"[CoreCardIO] User cancelled.");
     [scanViewController dismissViewControllerAnimated:YES completion:nil];
     if (_result) {
         _result(nil);
@@ -173,6 +179,7 @@
 }
 
 - (void)userDidProvideCreditCardInfo:(CardIOCreditCardInfo *)info inPaymentViewController:(CardIOPaymentViewController *)scanViewController {
+    NSLog(@"[CoreCardIO] Card info received.");
     NSMutableDictionary *cardInfo = [NSMutableDictionary dictionary];
     
     if (info.cardNumber) cardInfo[@"cardNumber"] = info.cardNumber;
@@ -183,6 +190,7 @@
     if (info.postalCode) cardInfo[@"postalCode"] = info.postalCode;
     if (info.cardholderName) cardInfo[@"cardholderName"] = info.cardholderName;
     
+    // FIX: Map values to match Dart enum expectations (lower camelCase)
     cardInfo[@"cardType"] = [self formatCardType:info.cardType];
 
     [scanViewController dismissViewControllerAnimated:YES completion:nil];
@@ -196,6 +204,8 @@
 #pragma mark - Helper Methods
 
 - (UIColor *)colorFromHex:(NSString *)hexString {
+    if (![self isNonNull:hexString]) return [UIColor greenColor]; // Default
+    
     unsigned rgbValue = 0;
     NSScanner *scanner = [NSScanner scannerWithString:hexString];
     if ([hexString hasPrefix:@"#"]) {
@@ -208,14 +218,15 @@
                            alpha:1.0];
 }
 
+// FIX: Updated strings to match Dart enum values
 - (NSString *)formatCardType:(CardIOCreditCardType)type {
     switch(type) {
-        case CardIOCreditCardTypeVisa: return @"Visa";
-        case CardIOCreditCardTypeMastercard: return @"MasterCard";
-        case CardIOCreditCardTypeAmex: return @"Amex";
-        case CardIOCreditCardTypeDiscover: return @"Discover";
-        case CardIOCreditCardTypeJCB: return @"JCB";
-        default: return @"Unknown";
+        case CardIOCreditCardTypeVisa: return @"visa";
+        case CardIOCreditCardTypeMastercard: return @"masterCard";
+        case CardIOCreditCardTypeAmex: return @"amex";
+        case CardIOCreditCardTypeDiscover: return @"discover";
+        case CardIOCreditCardTypeJCB: return @"jcb";
+        default: return @"unknown";
     }
 }
 
