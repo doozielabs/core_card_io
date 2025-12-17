@@ -2,25 +2,24 @@
 #import <CardIO/CardIO.h>
 #import <AVFoundation/AVFoundation.h>
 
-// 1. Define a subclass to intercept view appearance and apply the camera fix
+// 1. Define the interface for the custom View Controller
 @interface FixedCardIOPaymentViewController : CardIOPaymentViewController
+- (void)applyAutofocusFix;
 @end
 
 @implementation FixedCardIOPaymentViewController
 
-- (void)viewWillAppear:(BOOL)animated {
-    [super viewWillAppear:animated];
-    [self applyAutofocusFix];
-}
-
+// 2. Define the helper method first so it is visible to viewWillAppear
 - (void)applyAutofocusFix {
     if (@available(iOS 15.0, *)) {
         AVCaptureDevice *device = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
         if (device) {
             NSError *error = nil;
             // Check if the device supports focusing and has a large minimum focus distance
-            // (150mm is roughly the threshold where issues start occurring)
-            if (device.minimumFocusDistance > 150 || [self isNewerDevice]) {
+            // (150mm is roughly the threshold where issues start occurring on Pro models)
+            BOOL isProDevice = (device.minimumFocusDistance > 150);
+            
+            if (isProDevice) {
                 if ([device lockForConfiguration:&error]) {
                     // Set zoom factor to 2.0x to allow holding the phone further away
                     // This brings the card back to full size while respecting focus distance.
@@ -35,10 +34,10 @@
     }
 }
 
-// Helper to blindly apply fix for "Pro" models if minimumFocusDistance isn't reliable enough
-- (BOOL)isNewerDevice {
-    // You can refine this logic, but checking minimumFocusDistance is usually sufficient.
-    return YES; 
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    // Now the compiler knows about this method
+    [self applyAutofocusFix];
 }
 
 @end
@@ -48,8 +47,7 @@
 
 @implementation CoreCardIoPlugin {
     FlutterResult _result;
-    // Retain the controller to prevent deallocation during presentation
-    UIViewController *_scanViewController; 
+    UIViewController *_scanViewController;
 }
 
 + (void)registerWithRegistrar:(NSObject<FlutterPluginRegistrar>*)registrar {
@@ -70,10 +68,11 @@
 }
 
 - (void)scanCard:(NSDictionary*)arguments {
-    // 2. Use the FixedCardIOPaymentViewController instead of the standard one
-    CardIOPaymentViewController *scanViewController = [[FixedCardIOPaymentViewController alloc] initWithPaymentDelegate:self];
+    // Use the custom subclass FixedCardIOPaymentViewController
+    FixedCardIOPaymentViewController *scanViewController = [[FixedCardIOPaymentViewController alloc] initWithPaymentDelegate:self];
     
-    // Map arguments to CardIO properties
+    // --- Mapped Properties ---
+    
     if (arguments[@"guideColor"]) {
         scanViewController.guideColor = [self colorFromHex:arguments[@"guideColor"]];
     }
@@ -83,24 +82,20 @@
     if (arguments[@"useCardIOLogo"]) {
         scanViewController.useCardIOLogo = [arguments[@"useCardIOLogo"] boolValue];
     }
+    
+    // FIX 1: Map "suppressManualEntry" to "disableManualEntryButtons"
     if (arguments[@"suppressManualEntry"]) {
-        scanViewController.suppressManualEntry = [arguments[@"suppressManualEntry"] boolValue];
+        scanViewController.disableManualEntryButtons = [arguments[@"suppressManualEntry"] boolValue];
     }
+    
+    // FIX 2: Map "suppressConfirmation" to "suppressScanConfirmation"
     if (arguments[@"suppressConfirmation"]) {
-        scanViewController.suppressConfirmation = [arguments[@"suppressConfirmation"] boolValue];
+        scanViewController.suppressScanConfirmation = [arguments[@"suppressConfirmation"] boolValue];
     }
-    if (arguments[@"requireExpiry"]) {
-        scanViewController.requireExpiry = [arguments[@"requireExpiry"] boolValue];
-    }
-    if (arguments[@"requireCVV"]) {
-        scanViewController.requireCVV = [arguments[@"requireCVV"] boolValue];
-    }
-    if (arguments[@"requirePostalCode"]) {
-        scanViewController.requirePostalCode = [arguments[@"requirePostalCode"] boolValue];
-    }
-    if (arguments[@"restrictPostalCodeToNumericOnly"]) {
-        scanViewController.restrictPostalCodeToNumericOnly = [arguments[@"restrictPostalCodeToNumericOnly"] boolValue];
-    }
+    
+    // NOTE: 'requireExpiry', 'requireCVV', 'requirePostalCode' are not supported properties 
+    // on the iOS CardIOPaymentViewController and have been removed to fix build errors.
+    
     if (arguments[@"scanExpiry"]) {
         scanViewController.scanExpiry = [arguments[@"scanExpiry"] boolValue];
     }
@@ -123,7 +118,10 @@
 
 - (void)userDidCancelPaymentViewController:(CardIOPaymentViewController *)scanViewController {
     [scanViewController dismissViewControllerAnimated:YES completion:nil];
-    _result(nil); // Or appropriate error/null for cancellation
+    if (_result) {
+        _result(nil);
+        _result = nil;
+    }
 }
 
 - (void)userDidProvideCreditCardInfo:(CardIOCreditCardInfo *)info inPaymentViewController:(CardIOPaymentViewController *)scanViewController {
@@ -137,12 +135,14 @@
     if (info.postalCode) cardInfo[@"postalCode"] = info.postalCode;
     if (info.cardholderName) cardInfo[@"cardholderName"] = info.cardholderName;
     
-    // CardIO defines CardIOCreditCardType in its header, mapping it to string might be needed
-    // Simple mapping:
     cardInfo[@"cardType"] = [self formatCardType:info.cardType];
 
     [scanViewController dismissViewControllerAnimated:YES completion:nil];
-    _result(cardInfo);
+    
+    if (_result) {
+        _result(cardInfo);
+        _result = nil;
+    }
 }
 
 #pragma mark - Helper Methods
