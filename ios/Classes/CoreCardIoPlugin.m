@@ -2,46 +2,6 @@
 #import <CardIO/CardIO.h>
 #import <AVFoundation/AVFoundation.h>
 
-// 1. Define the interface for the custom View Controller
-@interface FixedCardIOPaymentViewController : CardIOPaymentViewController
-- (void)applyAutofocusFix;
-@end
-
-@implementation FixedCardIOPaymentViewController
-
-// 2. Define the helper method first so it is visible to viewWillAppear
-- (void)applyAutofocusFix {
-    if (@available(iOS 15.0, *)) {
-        AVCaptureDevice *device = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
-        if (device) {
-            NSError *error = nil;
-            // Check if the device supports focusing and has a large minimum focus distance
-            // (150mm is roughly the threshold where issues start occurring on Pro models)
-            BOOL isProDevice = (device.minimumFocusDistance > 150);
-            
-            if (isProDevice) {
-                if ([device lockForConfiguration:&error]) {
-                    // Set zoom factor to 2.0x to allow holding the phone further away
-                    // This brings the card back to full size while respecting focus distance.
-                    CGFloat zoomFactor = 2.0;
-                    if (zoomFactor <= device.activeFormat.videoMaxZoomFactor) {
-                        device.videoZoomFactor = zoomFactor;
-                    }
-                    [device unlockForConfiguration];
-                }
-            }
-        }
-    }
-}
-
-- (void)viewWillAppear:(BOOL)animated {
-    [super viewWillAppear:animated];
-    // Now the compiler knows about this method
-    [self applyAutofocusFix];
-}
-
-@end
-
 @interface CoreCardIoPlugin ()<CardIOPaymentViewControllerDelegate>
 @end
 
@@ -68,10 +28,10 @@
 }
 
 - (void)scanCard:(NSDictionary*)arguments {
-    // Use the custom subclass FixedCardIOPaymentViewController
-    FixedCardIOPaymentViewController *scanViewController = [[FixedCardIOPaymentViewController alloc] initWithPaymentDelegate:self];
+    // 1. Use the STANDARD CardIOPaymentViewController (Reverted from subclass to fix "screen not showing")
+    CardIOPaymentViewController *scanViewController = [[CardIOPaymentViewController alloc] initWithPaymentDelegate:self];
     
-    // --- Mapped Properties ---
+    // --- Mapped Properties (fixes property not found errors) ---
     
     if (arguments[@"guideColor"]) {
         scanViewController.guideColor = [self colorFromHex:arguments[@"guideColor"]];
@@ -83,18 +43,18 @@
         scanViewController.useCardIOLogo = [arguments[@"useCardIOLogo"] boolValue];
     }
     
-    // FIX 1: Map "suppressManualEntry" to "disableManualEntryButtons"
+    // Map "suppressManualEntry" to "disableManualEntryButtons"
     if (arguments[@"suppressManualEntry"]) {
         scanViewController.disableManualEntryButtons = [arguments[@"suppressManualEntry"] boolValue];
     }
     
-    // FIX 2: Map "suppressConfirmation" to "suppressScanConfirmation"
+    // Map "suppressConfirmation" to "suppressScanConfirmation"
     if (arguments[@"suppressConfirmation"]) {
         scanViewController.suppressScanConfirmation = [arguments[@"suppressConfirmation"] boolValue];
     }
     
-    // NOTE: 'requireExpiry', 'requireCVV', 'requirePostalCode' are not supported properties 
-    // on the iOS CardIOPaymentViewController and have been removed to fix build errors.
+    // Note: 'requireExpiry', 'requireCVV', 'requirePostalCode' are intentionally omitted
+    // as they are not supported on the iOS CardIOPaymentViewController class.
     
     if (arguments[@"scanExpiry"]) {
         scanViewController.scanExpiry = [arguments[@"scanExpiry"] boolValue];
@@ -111,7 +71,38 @@
     _scanViewController = scanViewController;
     
     UIViewController *rootViewController = [UIApplication sharedApplication].delegate.window.rootViewController;
-    [rootViewController presentViewController:scanViewController animated:YES completion:nil];
+    
+    // 2. Present the controller, then apply the fix in the completion block
+    [rootViewController presentViewController:scanViewController animated:YES completion:^{
+        [self applyAutofocusFix];
+    }];
+}
+
+// 3. The Camera Fix: Force Zoom 2x on newer devices (iOS 15+)
+- (void)applyAutofocusFix {
+    // We use a small delay to ensure CardIO has fully started its AVCaptureSession
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (@available(iOS 15.0, *)) {
+            AVCaptureDevice *device = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
+            if (device) {
+                // Check if device supports focus distance (approx proxy for "Pro" cameras or newer sensors)
+                BOOL isNewerDevice = (device.minimumFocusDistance > 100); 
+                
+                if (isNewerDevice) {
+                    NSError *error = nil;
+                    if ([device lockForConfiguration:&error]) {
+                        // 2.0x zoom allows the user to hold the card further away, 
+                        // bypassing the minimum focus distance limit of newer sensors.
+                        CGFloat zoomFactor = 2.0;
+                        if (zoomFactor <= device.activeFormat.videoMaxZoomFactor) {
+                            device.videoZoomFactor = zoomFactor;
+                        }
+                        [device unlockForConfiguration];
+                    }
+                }
+            }
+        }
+    });
 }
 
 #pragma mark - CardIOPaymentViewControllerDelegate
